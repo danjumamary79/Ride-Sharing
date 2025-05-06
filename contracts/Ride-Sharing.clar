@@ -363,3 +363,107 @@
     (ok (var-set platform-fee new-fee))
   )
 )
+
+
+
+(define-map driver-schedules
+  { driver: principal, day: uint }
+  {
+    start-hour: uint,
+    end-hour: uint,
+    max-rides: uint
+  }
+)
+
+(define-public (set-schedule (day uint) (start-hour uint) (end-hour uint) (max-rides uint))
+  (let ((driver tx-sender))
+    (asserts! (is-some (map-get? drivers driver)) err-not-found)
+    (asserts! (and (>= day u1) (<= day u7)) (err u200))
+    (asserts! (and (>= start-hour u0) (< start-hour u24)) (err u201))
+    (asserts! (and (>= end-hour u0) (< end-hour u24)) (err u202))
+    (asserts! (> end-hour start-hour) (err u203))
+    
+    (ok (map-set driver-schedules 
+      { driver: driver, day: day }
+      {
+        start-hour: start-hour,
+        end-hour: end-hour,
+        max-rides: max-rides
+      }
+    ))
+  )
+)
+
+(define-read-only (get-driver-schedule (driver principal) (day uint))
+  (map-get? driver-schedules { driver: driver, day: day })
+)
+
+
+(define-map emergency-contacts
+  principal
+  {
+    contact1: principal,
+    contact2: principal,
+    contact-count: uint
+  }
+)
+
+(define-map emergency-alerts
+  uint
+  {
+    ride-id: uint,
+    rider: principal,
+    driver: principal,
+    timestamp: uint,
+    location: (string-ascii 100),
+    resolved: bool
+  }
+)
+
+(define-data-var alert-counter uint u0)
+
+(define-public (add-emergency-contact (contact principal))
+  (let (
+    (user tx-sender)
+    (current-contacts (default-to 
+      { contact1: user, contact2: user, contact-count: u0 }
+      (map-get? emergency-contacts user)
+    ))
+  )
+    (asserts! (< (get contact-count current-contacts) u2) (err u300))
+    (ok (map-set emergency-contacts user
+      (merge current-contacts 
+        {
+          contact1: (if (is-eq (get contact-count current-contacts) u0)
+            contact
+            (get contact1 current-contacts)),
+          contact2: (if (is-eq (get contact-count current-contacts) u1)
+            contact
+            (get contact2 current-contacts)),
+          contact-count: (+ (get contact-count current-contacts) u1)
+        }
+      )
+    ))
+  )
+)
+
+(define-public (trigger-emergency-alert (ride-id uint) (location (string-ascii 100)))
+  (let (
+    (rider tx-sender)
+    (ride (unwrap! (map-get? active-rides ride-id) err-not-found))
+    (alert-id (var-get alert-counter))
+  )
+    (asserts! (is-eq rider (get rider ride)) err-not-rider)
+    (var-set alert-counter (+ alert-id u1))
+    (ok (map-set emergency-alerts alert-id
+      {
+        ride-id: ride-id,
+        rider: rider,
+        driver: (get driver ride),
+        timestamp: stacks-block-height,
+        location: location,
+        resolved: false
+      }
+    ))
+  )
+)
