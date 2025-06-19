@@ -467,3 +467,159 @@
     ))
   )
 )
+
+(define-map pricing-zones
+  uint
+  {
+    zone-name: (string-ascii 50),
+    base-multiplier: uint,
+    current-demand: uint,
+    active-drivers: uint,
+    last-updated: uint
+  }
+)
+
+(define-map time-multipliers
+  uint
+  uint
+)
+
+(define-map weather-multipliers
+  (string-ascii 20)
+  uint
+)
+
+(define-data-var zone-counter uint u0)
+
+(define-public (create-pricing-zone (zone-name (string-ascii 50)) (base-multiplier uint))
+  (let ((zone-id (var-get zone-counter)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set zone-counter (+ zone-id u1))
+    (ok (map-set pricing-zones zone-id
+      {
+        zone-name: zone-name,
+        base-multiplier: base-multiplier,
+        current-demand: u100,
+        active-drivers: u0,
+        last-updated: stacks-block-height
+      }
+    ))
+  )
+)
+
+(define-public (set-time-multiplier (hour uint) (multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (< hour u24) (err u400))
+    (asserts! (and (>= multiplier u50) (<= multiplier u300)) (err u401))
+    (ok (map-set time-multipliers hour multiplier))
+  )
+)
+
+(define-public (set-weather-multiplier (weather-condition (string-ascii 20)) (multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= multiplier u100) (<= multiplier u250)) (err u402))
+    (ok (map-set weather-multipliers weather-condition multiplier))
+  )
+)
+
+(define-public (update-zone-demand (zone-id uint) (demand-level uint))
+  (let ((zone (unwrap! (map-get? pricing-zones zone-id) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= demand-level u50) (<= demand-level u300)) (err u403))
+    (ok (map-set pricing-zones zone-id
+      (merge zone 
+        {
+          current-demand: demand-level,
+          last-updated: stacks-block-height
+        }
+      )
+    ))
+  )
+)
+
+(define-public (register-driver-in-zone (zone-id uint))
+  (let (
+    (driver tx-sender)
+    (zone (unwrap! (map-get? pricing-zones zone-id) err-not-found))
+  )
+    (asserts! (is-some (map-get? drivers driver)) err-not-found)
+    (ok (map-set pricing-zones zone-id
+      (merge zone 
+        {
+          active-drivers: (+ (get active-drivers zone) u1),
+          last-updated: stacks-block-height
+        }
+      )
+    ))
+  )
+)
+
+(define-public (create-dynamic-ride (start-location (string-ascii 100)) (end-location (string-ascii 100)) (base-price uint) (seats-available uint) (zone-id uint) (current-hour uint) (weather-condition (string-ascii 20)))
+  (let (
+    (driver tx-sender)
+    (ride-id (var-get ride-counter))
+    (final-price (unwrap! (calculate-dynamic-price base-price zone-id current-hour weather-condition) (err u404)))
+  )
+    (asserts! (is-some (map-get? drivers driver)) err-not-found)
+    (asserts! (< current-hour u24) (err u405))
+    (var-set ride-counter (+ ride-id u1))
+    (ok (map-set available-rides ride-id {
+      driver: driver,
+      start-location: start-location,
+      end-location: end-location,
+      price: final-price,
+      seats-available: seats-available,
+      timestamp: stacks-block-height
+    }))
+  )
+)
+
+(define-read-only (calculate-dynamic-price (base-price uint) (zone-id uint) (current-hour uint) (weather-condition (string-ascii 20)))
+  (let (
+    (zone (unwrap! (map-get? pricing-zones zone-id) err-not-found))
+    (time-mult (default-to u100 (map-get? time-multipliers current-hour)))
+    (weather-mult (default-to u100 (map-get? weather-multipliers weather-condition)))
+    (demand-mult (get current-demand zone))
+    (supply-mult (if (> (get active-drivers zone) u0)
+      (/ u10000 (+ (get active-drivers zone) u1))
+      u150))
+  )
+    (let (
+      (zone-adjusted (/ (* base-price (get base-multiplier zone)) u100))
+      (time-adjusted (/ (* zone-adjusted time-mult) u100))
+      (weather-adjusted (/ (* time-adjusted weather-mult) u100))
+      (demand-adjusted (/ (* weather-adjusted demand-mult) u100))
+      (final-price (/ (* demand-adjusted supply-mult) u100))
+    )
+      (ok final-price)
+    )
+  )
+)
+
+(define-read-only (get-pricing-zone (zone-id uint))
+  (map-get? pricing-zones zone-id)
+)
+
+(define-read-only (get-current-multipliers (zone-id uint) (current-hour uint) (weather-condition (string-ascii 20)))
+  (let (
+    (zone (unwrap! (map-get? pricing-zones zone-id) err-not-found))
+    (time-mult (default-to u100 (map-get? time-multipliers current-hour)))
+    (weather-mult (default-to u100 (map-get? weather-multipliers weather-condition)))
+  )
+    (ok {
+      zone-multiplier: (get base-multiplier zone),
+      time-multiplier: time-mult,
+      weather-multiplier: weather-mult,
+      demand-multiplier: (get current-demand zone),
+      supply-factor: (if (> (get active-drivers zone) u0)
+        (/ u10000 (+ (get active-drivers zone) u1))
+        u150)
+    })
+  )
+)
+
+(define-read-only (preview-dynamic-price (base-price uint) (zone-id uint) (current-hour uint) (weather-condition (string-ascii 20)))
+  (calculate-dynamic-price base-price zone-id current-hour weather-condition)
+)
