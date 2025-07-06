@@ -623,3 +623,199 @@
 (define-read-only (preview-dynamic-price (base-price uint) (zone-id uint) (current-hour uint) (weather-condition (string-ascii 20)))
   (calculate-dynamic-price base-price zone-id current-hour weather-condition)
 )
+
+;; Pool ride constants
+(define-constant err-pool-full (err u500))
+(define-constant err-pool-not-found (err u501))
+(define-constant err-already-in-pool (err u502))
+(define-constant err-pool-not-ready (err u503))
+(define-constant err-insufficient-participants (err u504))
+
+;; Pool ride data maps
+(define-map pool-rides
+  uint
+  {
+    driver: principal,
+    start-location: (string-ascii 100),
+    end-location: (string-ascii 100),
+    base-price: uint,
+    max-participants: uint,
+    current-participants: uint,
+    participants: (list 8 principal),
+    individual-cost: uint,
+    started: bool,
+    completed: bool,
+    timestamp: uint
+  }
+)
+
+(define-map pool-participants
+  { pool-id: uint, participant: principal }
+  {
+    joined-at: uint,
+    paid: bool,
+    pickup-location: (string-ascii 100)
+  }
+)
+
+(define-data-var pool-counter uint u0)
+
+(define-public (create-pool-ride (start-location (string-ascii 100)) (end-location (string-ascii 100)) (base-price uint) (max-participants uint))
+  (let (
+    (driver tx-sender)
+    (pool-id (var-get pool-counter))
+  )
+    (asserts! (is-some (map-get? drivers driver)) err-not-found)
+    (asserts! (and (>= max-participants u2) (<= max-participants u8)) (err u505))
+    (var-set pool-counter (+ pool-id u1))
+    (ok (map-set pool-rides pool-id {
+      driver: driver,
+      start-location: start-location,
+      end-location: end-location,
+      base-price: base-price,
+      max-participants: max-participants,
+      current-participants: u0,
+      participants: (list),
+      individual-cost: (/ base-price max-participants),
+      started: false,
+      completed: false,
+      timestamp: stacks-block-height
+    }))
+  )
+)
+
+(define-public (join-pool-ride (pool-id uint) (pickup-location (string-ascii 100)))
+  (let (
+    (rider tx-sender)
+    (pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found))
+    (individual-cost (get individual-cost pool))
+  )
+    (asserts! (is-some (map-get? riders rider)) err-not-found)
+    (asserts! (< (get current-participants pool) (get max-participants pool)) err-pool-full)
+    (asserts! (is-none (map-get? pool-participants { pool-id: pool-id, participant: rider })) err-already-in-pool)
+    (asserts! (not (get started pool)) err-ride-already-started)
+    
+    (try! (stx-transfer? individual-cost rider (as-contract tx-sender)))
+    
+    (map-set pool-participants { pool-id: pool-id, participant: rider } {
+      joined-at: stacks-block-height,
+      paid: true,
+      pickup-location: pickup-location
+    })
+    
+    (let ((new-participants (unwrap! (as-max-len? (append (get participants pool) rider) u8) (err u506))))
+      (ok (map-set pool-rides pool-id 
+        (merge pool {
+          current-participants: (+ (get current-participants pool) u1),
+          participants: new-participants
+        })))
+    )
+  )
+)
+
+(define-public (start-pool-ride (pool-id uint))
+  (let (
+    (driver tx-sender)
+    (pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found))
+  )
+    (asserts! (is-eq driver (get driver pool)) err-not-driver)
+    (asserts! (>= (get current-participants pool) u2) err-insufficient-participants)
+    (asserts! (not (get started pool)) err-ride-already-started)
+    
+    (ok (map-set pool-rides pool-id 
+      (merge pool { started: true })))
+  )
+)
+
+(define-public (complete-pool-ride (pool-id uint))
+  (let (
+    (driver tx-sender)
+    (pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found))
+  )
+    (asserts! (is-eq driver (get driver pool)) err-not-driver)
+    (asserts! (get started pool) err-ride-not-started)
+    (asserts! (not (get completed pool)) err-ride-already-completed)
+    
+    (ok (map-set pool-rides pool-id 
+      (merge pool { completed: true })))
+  )
+)
+
+(define-public (release-pool-payment (pool-id uint))
+  (let (
+    (caller tx-sender)
+    (pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found))
+    (driver (get driver pool))
+    (total-collected (* (get individual-cost pool) (get current-participants pool)))
+    (platform-fee-amount (/ (* total-collected (var-get platform-fee)) u100))
+    (driver-amount (- total-collected platform-fee-amount))
+    (driver-data (unwrap! (map-get? drivers driver) err-not-found))
+  )
+    (asserts! (get completed pool) err-ride-not-completed)
+    (asserts! (is-some (map-get? pool-participants { pool-id: pool-id, participant: caller })) err-not-rider)
+    
+    (try! (as-contract (stx-transfer? driver-amount tx-sender driver)))
+    (try! (as-contract (stx-transfer? platform-fee-amount tx-sender contract-owner)))
+    
+    (map-set drivers driver 
+      (merge driver-data {
+        total-rides: (+ (get total-rides driver-data) u1),
+        earnings: (+ (get earnings driver-data) driver-amount)
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (leave-pool-ride (pool-id uint))
+  (let (
+    (rider tx-sender)
+    (pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found))
+    (participant-data (unwrap! (map-get? pool-participants { pool-id: pool-id, participant: rider }) err-not-found))
+    (individual-cost (get individual-cost pool))
+  )
+    (asserts! (not (get started pool)) err-ride-already-started)
+    
+    (try! (as-contract (stx-transfer? individual-cost tx-sender rider)))
+    
+    (map-delete pool-participants { pool-id: pool-id, participant: rider })
+    
+    (let ((updated-participants (filter remove-participant (get participants pool))))
+      (ok (map-set pool-rides pool-id 
+        (merge pool {
+          current-participants: (- (get current-participants pool) u1),
+          participants: updated-participants
+        })))
+    )
+  )
+)
+
+(define-private (remove-participant (participant principal))
+  (not (is-eq participant tx-sender))
+)
+
+(define-read-only (get-pool-ride (pool-id uint))
+  (map-get? pool-rides pool-id)
+)
+
+(define-read-only (get-pool-participant (pool-id uint) (participant principal))
+  (map-get? pool-participants { pool-id: pool-id, participant: participant })
+)
+
+(define-read-only (calculate-pool-savings (pool-id uint))
+  (let ((pool (unwrap! (map-get? pool-rides pool-id) err-pool-not-found)))
+    (let (
+      (individual-cost (get individual-cost pool))
+      (solo-cost (get base-price pool))
+      (savings (- solo-cost individual-cost))
+      (savings-percentage (/ (* savings u100) solo-cost))
+    )
+      (ok {
+        individual-cost: individual-cost,
+        solo-cost: solo-cost,
+        savings: savings,
+        savings-percentage: savings-percentage
+      })
+    )
+  )
+)
