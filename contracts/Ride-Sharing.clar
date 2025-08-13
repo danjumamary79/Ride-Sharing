@@ -624,6 +624,328 @@
   (calculate-dynamic-price base-price zone-id current-hour weather-condition)
 )
 
+;; Community Dispute Resolution System
+
+;; Dispute constants
+(define-constant err-dispute-not-found (err u600))
+(define-constant err-not-dispute-participant (err u601))
+(define-constant err-dispute-already-exists (err u602))
+(define-constant err-dispute-already-resolved (err u603))
+(define-constant err-not-arbitrator (err u604))
+(define-constant err-arbitrator-already-voted (err u605))
+(define-constant err-insufficient-stake (err u606))
+(define-constant err-invalid-dispute-type (err u607))
+(define-constant err-dispute-period-expired (err u608))
+(define-constant err-not-enough-arbitrators (err u609))
+
+;; Dispute data structures
+(define-map disputes
+  uint ;; dispute-id
+  {
+    ride-id: uint,
+    complainant: principal, ;; who filed the dispute
+    defendant: principal, ;; who the dispute is against
+    dispute-type: uint, ;; 1=payment, 2=service, 3=safety, 4=other
+    description: (string-ascii 200),
+    amount-disputed: uint,
+    filed-at: uint,
+    resolved: bool,
+    resolution: uint, ;; 0=pending, 1=favor-complainant, 2=favor-defendant, 3=split
+    total-votes: uint,
+    votes-for-complainant: uint,
+    votes-for-defendant: uint,
+    assigned-arbitrators: (list 3 principal),
+    arbitrator-count: uint
+  }
+)
+
+;; Arbitrator registration and qualifications
+(define-map arbitrators
+  principal
+  {
+    registered-at: uint,
+    total-cases: uint,
+    correct-votes: uint,
+    reputation-score: uint,
+    stake-amount: uint,
+    active: bool,
+    specialization: uint ;; 1=payment, 2=service, 3=safety, 4=general
+  }
+)
+
+;; Individual arbitrator votes for disputes
+(define-map arbitrator-votes
+  { dispute-id: uint, arbitrator: principal }
+  {
+    vote: uint, ;; 1=favor-complainant, 2=favor-defendant
+    reasoning: (string-ascii 150),
+    voted-at: uint
+  }
+)
+
+;; Evidence submitted for disputes
+(define-map dispute-evidence
+  { dispute-id: uint, submitter: principal }
+  {
+    evidence-type: uint, ;; 1=description, 2=witness, 3=photo-hash
+    content: (string-ascii 200),
+    submitted-at: uint
+  }
+)
+
+;; Counters and settings
+(define-data-var dispute-counter uint u0)
+(define-data-var arbitrator-stake-required uint u1000000) ;; 1 STX in microSTX
+(define-data-var dispute-filing-fee uint u100000) ;; 0.1 STX
+(define-data-var arbitrator-reward uint u50000) ;; 0.05 STX per case
+(define-data-var dispute-period-blocks uint u1008) ;; ~7 days
+
+;; Register as an arbitrator
+(define-public (register-arbitrator (specialization uint))
+  (let ((arbitrator tx-sender))
+    (asserts! (is-none (map-get? arbitrators arbitrator)) err-already-exists)
+    (asserts! (and (>= specialization u1) (<= specialization u4)) err-invalid-dispute-type)
+    
+    ;; Require stake to become arbitrator
+    (try! (stx-transfer? (var-get arbitrator-stake-required) arbitrator (as-contract tx-sender)))
+    
+    (ok (map-set arbitrators arbitrator {
+      registered-at: stacks-block-height,
+      total-cases: u0,
+      correct-votes: u0,
+      reputation-score: u100, ;; Start with 100 reputation
+      stake-amount: (var-get arbitrator-stake-required),
+      active: true,
+      specialization: specialization
+    }))
+  )
+)
+
+;; File a dispute about a ride
+(define-public (file-dispute (ride-id uint) (defendant principal) (dispute-type uint) (description (string-ascii 200)) (amount-disputed uint))
+  (let (
+    (complainant tx-sender)
+    (dispute-id (var-get dispute-counter))
+    (ride (unwrap! (map-get? active-rides ride-id) err-not-found))
+  )
+    ;; Verify complainant is part of the ride
+    (asserts! (or (is-eq complainant (get rider ride)) (is-eq complainant (get driver ride))) err-not-dispute-participant)
+    ;; Verify defendant is the other party
+    (asserts! (or (is-eq defendant (get rider ride)) (is-eq defendant (get driver ride))) err-not-dispute-participant)
+    (asserts! (not (is-eq complainant defendant)) err-not-dispute-participant)
+    (asserts! (and (>= dispute-type u1) (<= dispute-type u4)) err-invalid-dispute-type)
+    
+    ;; Simplified check - in production would check against existing disputes
+    (asserts! (< dispute-id u99999) err-dispute-already-exists)
+    
+    ;; Charge filing fee
+    (try! (stx-transfer? (var-get dispute-filing-fee) complainant (as-contract tx-sender)))
+    
+    (var-set dispute-counter (+ dispute-id u1))
+    
+    (ok (map-set disputes dispute-id {
+      ride-id: ride-id,
+      complainant: complainant,
+      defendant: defendant,
+      dispute-type: dispute-type,
+      description: description,
+      amount-disputed: amount-disputed,
+      filed-at: stacks-block-height,
+      resolved: false,
+      resolution: u0,
+      total-votes: u0,
+      votes-for-complainant: u0,
+      votes-for-defendant: u0,
+      assigned-arbitrators: (list),
+      arbitrator-count: u0
+    }))
+  )
+)
+
+;; Submit evidence for a dispute
+(define-public (submit-evidence (dispute-id uint) (evidence-type uint) (content (string-ascii 200)))
+  (let (
+    (submitter tx-sender)
+    (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+  )
+    (asserts! (or (is-eq submitter (get complainant dispute)) (is-eq submitter (get defendant dispute))) err-not-dispute-participant)
+    (asserts! (not (get resolved dispute)) err-dispute-already-resolved)
+    (asserts! (and (>= evidence-type u1) (<= evidence-type u3)) (err u610))
+    
+    (ok (map-set dispute-evidence { dispute-id: dispute-id, submitter: submitter } {
+      evidence-type: evidence-type,
+      content: content,
+      submitted-at: stacks-block-height
+    }))
+  )
+)
+
+;; Assign arbitrators to a dispute (called by contract owner or automated)
+(define-public (assign-arbitrators (dispute-id uint) (arbitrator1 principal) (arbitrator2 principal) (arbitrator3 principal))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get resolved dispute)) err-dispute-already-resolved)
+    (asserts! (is-eq (get arbitrator-count dispute) u0) (err u611))
+    
+    ;; Verify all are registered arbitrators
+    (asserts! (is-some (map-get? arbitrators arbitrator1)) err-not-arbitrator)
+    (asserts! (is-some (map-get? arbitrators arbitrator2)) err-not-arbitrator)
+    (asserts! (is-some (map-get? arbitrators arbitrator3)) err-not-arbitrator)
+    
+    (let ((assigned-list (list arbitrator1 arbitrator2 arbitrator3)))
+      (ok (map-set disputes dispute-id 
+        (merge dispute {
+          assigned-arbitrators: assigned-list,
+          arbitrator-count: u3
+        })))
+    )
+  )
+)
+
+;; Vote on a dispute as an arbitrator
+(define-public (vote-on-dispute (dispute-id uint) (vote uint) (reasoning (string-ascii 150)))
+  (let (
+    (arbitrator tx-sender)
+    (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+  )
+    (asserts! (not (get resolved dispute)) err-dispute-already-resolved)
+    (asserts! (and (>= vote u1) (<= vote u2)) (err u612))
+    (asserts! (is-some (index-of? (get assigned-arbitrators dispute) arbitrator)) err-not-arbitrator)
+    (asserts! (is-none (map-get? arbitrator-votes { dispute-id: dispute-id, arbitrator: arbitrator })) err-arbitrator-already-voted)
+    
+    ;; Record the vote
+    (map-set arbitrator-votes { dispute-id: dispute-id, arbitrator: arbitrator } {
+      vote: vote,
+      reasoning: reasoning,
+      voted-at: stacks-block-height
+    })
+    
+    ;; Update dispute vote counts
+    (let (
+      (new-total-votes (+ (get total-votes dispute) u1))
+      (new-complainant-votes (if (is-eq vote u1) (+ (get votes-for-complainant dispute) u1) (get votes-for-complainant dispute)))
+      (new-defendant-votes (if (is-eq vote u2) (+ (get votes-for-defendant dispute) u1) (get votes-for-defendant dispute)))
+    )
+      (map-set disputes dispute-id 
+        (merge dispute {
+          total-votes: new-total-votes,
+          votes-for-complainant: new-complainant-votes,
+          votes-for-defendant: new-defendant-votes
+        }))
+      
+      ;; Check if we have majority and resolve
+      (if (>= new-total-votes u2)
+        (auto-resolve-dispute dispute-id)
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Automatically resolve dispute based on votes
+(define-private (auto-resolve-dispute (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+    (let (
+      (complainant-votes (get votes-for-complainant dispute))
+      (defendant-votes (get votes-for-defendant dispute))
+      (resolution (if (> complainant-votes defendant-votes) u1 
+                    (if (> defendant-votes complainant-votes) u2 u3)))
+    )
+      ;; Update dispute as resolved
+      (map-set disputes dispute-id 
+        (merge dispute { 
+          resolved: true,
+          resolution: resolution
+        }))
+      
+      ;; Distribute compensation based on resolution
+      (try! (distribute-dispute-compensation dispute-id resolution))
+      
+      ;; Reward arbitrators
+      (try! (reward-arbitrators dispute-id))
+      
+      (ok true)
+    )
+  )
+)
+
+;; Distribute compensation based on dispute resolution
+(define-private (distribute-dispute-compensation (dispute-id uint) (resolution uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+    (let ((amount (get amount-disputed dispute)))
+      (if (is-eq resolution u1) ;; Favor complainant
+        (as-contract (stx-transfer? amount tx-sender (get complainant dispute)))
+        (if (is-eq resolution u2) ;; Favor defendant  
+          (as-contract (stx-transfer? amount tx-sender (get defendant dispute)))
+          ;; Split resolution
+          (begin
+            (try! (as-contract (stx-transfer? (/ amount u2) tx-sender (get complainant dispute))))
+            (as-contract (stx-transfer? (/ amount u2) tx-sender (get defendant dispute)))
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Reward arbitrators for their work
+(define-private (reward-arbitrators (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+    (let ((arbitrators-list (get assigned-arbitrators dispute)))
+      (try! (pay-arbitrator (unwrap! (element-at? arbitrators-list u0) (ok true))))
+      (try! (pay-arbitrator (unwrap! (element-at? arbitrators-list u1) (ok true))))
+      (try! (pay-arbitrator (unwrap! (element-at? arbitrators-list u2) (ok true))))
+      (ok true)
+    )
+  )
+)
+
+;; Pay individual arbitrator
+(define-private (pay-arbitrator (arbitrator principal))
+  (let ((arbitrator-data (unwrap! (map-get? arbitrators arbitrator) err-not-arbitrator)))
+    (try! (as-contract (stx-transfer? (var-get arbitrator-reward) tx-sender arbitrator)))
+    (ok (map-set arbitrators arbitrator 
+      (merge arbitrator-data {
+        total-cases: (+ (get total-cases arbitrator-data) u1)
+      })))
+  )
+)
+
+;; Helper function to get disputes for a ride (simplified check)
+(define-private (get-disputes-for-ride (ride-id uint))
+  (list) ;; Simplified implementation
+)
+
+;; Read-only functions
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-arbitrator-info (arbitrator principal))
+  (map-get? arbitrators arbitrator)
+)
+
+(define-read-only (get-dispute-evidence (dispute-id uint) (submitter principal))
+  (map-get? dispute-evidence { dispute-id: dispute-id, submitter: submitter })
+)
+
+(define-read-only (get-arbitrator-vote (dispute-id uint) (arbitrator principal))
+  (map-get? arbitrator-votes { dispute-id: dispute-id, arbitrator: arbitrator })
+)
+
+(define-read-only (get-dispute-status (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+    (ok {
+      resolved: (get resolved dispute),
+      total-votes: (get total-votes dispute),
+      complainant-votes: (get votes-for-complainant dispute),
+      defendant-votes: (get votes-for-defendant dispute),
+      resolution: (get resolution dispute)
+    })
+  )
+)
+
 ;; Pool ride constants
 (define-constant err-pool-full (err u500))
 (define-constant err-pool-not-found (err u501))
@@ -819,3 +1141,4 @@
     )
   )
 )
+
