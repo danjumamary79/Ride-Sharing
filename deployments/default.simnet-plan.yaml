@@ -54,4 +54,9 @@ plan:
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
             path: "contracts\\Ride-Sharing.clar"
             clarity-version: 3
+        - emulated-contract-publish:
+            contract-name: RideLoyalty
+            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            path: "contracts\\RideLoyalty.clar"
+            clarity-version: 3
       epoch: "3.1"
